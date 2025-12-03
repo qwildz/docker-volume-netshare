@@ -1,15 +1,21 @@
 [Unit]
 Description=Docker NFS, AWS EFS & Samba/CIFS Volume Plugin
-Documentation=https://github.com/gondor/docker-volume-netshare
+Documentation=https://github.com/ContainX/docker-volume-netshare
 Wants=network-online.target
-After=network-online.target
-Before=docker.service
+After=network-online.target docker.service
+Requires=docker.service
+BindsTo=docker.service
 
 
 [Service]
-EnvironmentFile=/etc/sysconfig/docker-volume-netshare
+# Environment files: /etc/default/ takes precedence over /etc/sysconfig/
+# The '-' prefix means the file is optional (no error if missing)
+EnvironmentFile=-/etc/sysconfig/docker-volume-netshare
+EnvironmentFile=-/etc/default/docker-volume-netshare
 ExecStart=/usr/bin/docker-volume-netshare $DKV_NETSHARE_OPTS
-StandardOutput=syslog
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
 
 [Install]
 WantedBy=multi-user.target
