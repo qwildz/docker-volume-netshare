@@ -177,10 +177,11 @@ func (m *MountManager) AddMount(name string, hostdir string, connections int) {
 //Checking volume references with started and stopped containers as well.
 func checkReferences(volumeName string) int {
 
-	cli, err := client.NewEnvClient()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		log.Error(err)
 	}
+	defer cli.Close()
 
 	var counter = 0
 	ContainerListResponse, err := cli.ContainerList(context.Background(), container.ListOptions{All: true}) // All : true will return the stopped containers as well.

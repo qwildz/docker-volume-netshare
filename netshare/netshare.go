@@ -287,10 +287,11 @@ func isTCPEnabled() bool {
 func syncDockerState(driverName string) *drivers.MountManager {
 	log.Infof("Checking for the references of volumes in docker daemon.")
 	mount := newMountManager()
-	cli, err := client.NewEnvClient()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		log.Error(err)
 	}
+	defer cli.Close()
 
 	volumes, err := cli.VolumeList(context.Background(), volume.ListOptions{})
 	if err != nil {
@@ -315,11 +316,12 @@ func newMountManager() *drivers.MountManager {
 
 // The number of running containers using Volume
 func activeConnections(volumeName string) int {
-	cli, err := client.NewEnvClient()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 
 	if err != nil {
 		log.Error(err)
 	}
+	defer cli.Close()
 	var counter = 0
 	ContainerListResponse, err := cli.ContainerList(context.Background(), container.ListOptions{}) //Only check the running containers using volume
 	if err != nil {

@@ -51,7 +51,13 @@ func (e efsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) 
 	if e.mountm.HasMount(r.Name) && e.mountm.Count(r.Name) > 0 {
 		log.Infof("Using existing EFS volume mount: %s", hostdir)
 		e.mountm.Increment(r.Name)
-		return &volume.MountResponse{Mountpoint: hostdir}, nil
+		if err := run(fmt.Sprintf("mountpoint -q %s", hostdir)); err != nil {
+			log.Infof("Existing EFS volume not mounted, force remount.")
+			// Decrement to maintain count before remount
+			e.mountm.Decrement(r.Name)
+		} else {
+			return &volume.MountResponse{Mountpoint: hostdir}, nil
+		}
 	}
 
 	log.Infof("Mounting EFS volume %s on %s", source, hostdir)

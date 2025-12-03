@@ -1,6 +1,8 @@
 module github.com/ContainX/docker-volume-netshare
 
-go 1.24.10
+go 1.24.0
+
+toolchain go1.24.10
 
 require (
 	github.com/docker/docker v27.5.1+incompatible
