@@ -1,0 +1,59 @@
+# nfpm configuration file for building .deb packages
+# Documentation: https://nfpm.goreleaser.com/configuration/
+
+name: docker-volume-netshare
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: default
+priority: extra
+maintainer: ContainX <https://github.com/ContainX>
+description: |
+  Docker NFS, AWS EFS & Samba/CIFS Volume Plugin.
+  Provides docker volume support for NFS v3 and 4, EFS as well as CIFS/Samba.
+vendor: ContainX
+homepage: https://github.com/ContainX/docker-volume-netshare
+license: Apache-2.0
+
+# Dependencies
+depends:
+  - nfs-common
+  - cifs-utils
+
+# Package contents
+contents:
+  # Binary
+  - src: ../docker-volume-netshare
+    dst: /usr/bin/docker-volume-netshare
+    file_info:
+      mode: 0755
+
+  # Systemd service file
+  - src: ../support/systemd/lib/systemd/system/docker-volume-netshare.service
+    dst: /lib/systemd/system/docker-volume-netshare.service
+    file_info:
+      mode: 0644
+
+  # Default configuration (for sysvinit compatibility)
+  - src: ../support/sysvinit-debian/etc/default/docker-volume-netshare
+    dst: /etc/default/docker-volume-netshare
+    type: config|noreplace
+    file_info:
+      mode: 0644
+
+  # Sysconfig for systemd (create parent directory)
+  - src: ../support/systemd/etc/sysconfig/docker-volume-netshare
+    dst: /etc/sysconfig/docker-volume-netshare
+    type: config|noreplace
+    file_info:
+      mode: 0644
+
+  # SysVinit script (for older systems)
+  - src: ../support/sysvinit-debian/etc/init.d/docker-volume-netshare
+    dst: /etc/init.d/docker-volume-netshare
+    file_info:
+      mode: 0755
+
+scripts:
+  postinstall: ./scripts/postinstall.sh
+  preremove: ./scripts/preremove.sh
