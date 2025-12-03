@@ -51,7 +51,13 @@ func (n cephDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error)
 	if n.mountm.HasMount(r.Name) && n.mountm.Count(r.Name) > 0 {
 		log.Infof("Using existing CEPH volume mount: %s", hostdir)
 		n.mountm.Increment(r.Name)
-		return &volume.MountResponse{Mountpoint: hostdir}, nil
+		if err := run(fmt.Sprintf("mountpoint -q %s", hostdir)); err != nil {
+			log.Infof("Existing CEPH volume not mounted, force remount.")
+			// Decrement to maintain count before remount
+			n.mountm.Decrement(r.Name)
+		} else {
+			return &volume.MountResponse{Mountpoint: hostdir}, nil
+		}
 	}
 
 	log.Infof("Mounting CEPH volume %s on %s", source, hostdir)

@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/dickeyxxx/netrc"
 	"github.com/docker/go-plugins-helpers/volume"
+	"github.com/jdx/go-netrc"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -97,6 +97,8 @@ func (c CifsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error)
 		c.mountm.Increment(r.Name)
 		if err := run(fmt.Sprintf("mountpoint -q %s", hostdir)); err != nil {
 			log.Infof("Existing CIFS volume not mounted, force remount.")
+			// Decrement to maintain count before remount
+			c.mountm.Decrement(r.Name)
 		} else {
 			return &volume.MountResponse{Mountpoint: hostdir}, nil
 		}

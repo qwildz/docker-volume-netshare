@@ -9,10 +9,10 @@ import (
 	"syscall"
 
 	"github.com/ContainX/docker-volume-netshare/netshare/drivers"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
-	"github.com/docker/go-plugins-helpers/volume"
+	volumeplugin "github.com/docker/go-plugins-helpers/volume"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -115,7 +115,7 @@ func Execute() {
 }
 
 func setupFlags() {
-	rootCmd.PersistentFlags().StringVar(&baseDir, BasedirFlag, filepath.Join(volume.DefaultDockerRootDirectory, PluginAlias), "Mounted volume base directory")
+	rootCmd.PersistentFlags().StringVar(&baseDir, BasedirFlag, filepath.Join(volumeplugin.DefaultDockerRootDirectory, PluginAlias), "Mounted volume base directory")
 	rootCmd.PersistentFlags().Bool(TCPFlag, false, "Bind to TCP rather than Unix sockets.  Can also be set via NETSHARE_TCP_ENABLED")
 	rootCmd.PersistentFlags().String(PortFlag, ":8877", "TCP Port if --tcp flag is true.  :PORT for all interfaces or ADDRESS:PORT to bind.")
 	rootCmd.PersistentFlags().Bool(VerboseFlag, false, "Turns on verbose logging")
@@ -252,8 +252,8 @@ func rootForType(dt drivers.DriverType) string {
 	return filepath.Join(baseDir, dt.String())
 }
 
-func start(dt drivers.DriverType, driver volume.Driver) {
-	h := volume.NewHandler(driver)
+func start(dt drivers.DriverType, driver volumeplugin.Driver) {
+	h := volumeplugin.NewHandler(driver)
 	if isTCPEnabled() {
 		addr := os.Getenv(EnvTCPAddr)
 		if addr == "" {
@@ -287,12 +287,13 @@ func isTCPEnabled() bool {
 func syncDockerState(driverName string) *drivers.MountManager {
 	log.Infof("Checking for the references of volumes in docker daemon.")
 	mount := newMountManager()
-	cli, err := client.NewEnvClient()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		log.Error(err)
 	}
+	defer cli.Close()
 
-	volumes, err := cli.VolumeList(context.Background(), filters.Args{})
+	volumes, err := cli.VolumeList(context.Background(), volume.ListOptions{})
 	if err != nil {
 		log.Fatal(err, ". Use -a flag to setup the DOCKER_API_VERSION. Run 'docker-volume-netshare --help' for usage.")
 	}
@@ -315,13 +316,14 @@ func newMountManager() *drivers.MountManager {
 
 // The number of running containers using Volume
 func activeConnections(volumeName string) int {
-	cli, err := client.NewEnvClient()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 
 	if err != nil {
 		log.Error(err)
 	}
+	defer cli.Close()
 	var counter = 0
-	ContainerListResponse, err := cli.ContainerList(context.Background(), types.ContainerListOptions{}) //Only check the running containers using volume
+	ContainerListResponse, err := cli.ContainerList(context.Background(), container.ListOptions{}) //Only check the running containers using volume
 	if err != nil {
 		log.Fatal(err, ". Use -a flag to setup the DOCKER_API_VERSION. Run 'docker-volume-netshare --help' for usage.")
 	}
