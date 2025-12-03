@@ -5,7 +5,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-plugins-helpers/volume"
 	log "github.com/sirupsen/logrus"
@@ -183,7 +183,7 @@ func checkReferences(volumeName string) int {
 	}
 
 	var counter = 0
-	ContainerListResponse, err := cli.ContainerList(context.Background(), types.ContainerListOptions{All: true}) // All : true will return the stopped containers as well.
+	ContainerListResponse, err := cli.ContainerList(context.Background(), container.ListOptions{All: true}) // All : true will return the stopped containers as well.
 	if err != nil {
 		log.Fatal(err, ". Use -a flag to setup the DOCKER_API_VERSION. Run 'docker-volume-netshare --help' for usage.")
 	}
