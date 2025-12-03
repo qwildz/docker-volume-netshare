@@ -174,7 +174,7 @@ func (m *MountManager) AddMount(name string, hostdir string, connections int) {
 	m.mounts[name] = &mount{name: name, hostdir: hostdir, managed: true, connections: connections}
 }
 
-//Checking volume references with started and stopped containers as well.
+// Checking volume references with started and stopped containers as well.
 func checkReferences(volumeName string) int {
 
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())

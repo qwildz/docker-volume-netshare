@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/jdx/go-netrc"
 	"github.com/docker/go-plugins-helpers/volume"
+	"github.com/jdx/go-netrc"
 	log "github.com/sirupsen/logrus"
 )
 
