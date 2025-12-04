@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/ContainX/docker-volume-netshare/netshare/drivers"
 	"github.com/docker/docker/api/types/container"
@@ -180,9 +181,9 @@ func execCEPH(cmd *cobra.Command, args []string) {
 	if len(context) > 0 {
 		context = "context=" + "\"" + context + "\""
 	}
-	mount := syncDockerState("ceph")
+	mount := newMountManager()
 	d := drivers.NewCephDriver(rootForType(drivers.CEPH), username, password, context, cephmount, cephport, servermount, cephopts, mount)
-	start(drivers.CEPH, d)
+	start(drivers.CEPH, d, "ceph", mount)
 }
 
 func execNFS(cmd *cobra.Command, args []string) {
@@ -196,20 +197,20 @@ func execNFS(cmd *cobra.Command, args []string) {
 		}
 	}
 	options, _ := cmd.Flags().GetString(OptionsFlag)
-	mount := syncDockerState("nfs")
+	mount := newMountManager()
 	d := drivers.NewNFSDriver(rootForType(drivers.NFS), version, options, mount)
 	startOutput(fmt.Sprintf("NFS Version %d :: options: '%s'", version, options))
-	start(drivers.NFS, d)
+	start(drivers.NFS, d, "nfs", mount)
 }
 
 func execEFS(cmd *cobra.Command, args []string) {
 	resolve, _ := cmd.Flags().GetBool(NoResolveFlag)
 	ns, _ := cmd.Flags().GetString(NameServerFlag)
 	setDockerEnv()
-	mount := syncDockerState("efs")
+	mount := newMountManager()
 	d := drivers.NewEFSDriver(rootForType(drivers.EFS), ns, !resolve, mount)
 	startOutput(fmt.Sprintf("EFS :: resolve: %v, ns: %s", resolve, ns))
-	start(drivers.EFS, d)
+	start(drivers.EFS, d, "efs", mount)
 }
 
 func execCIFS(cmd *cobra.Command, args []string) {
@@ -225,14 +226,14 @@ func execCIFS(cmd *cobra.Command, args []string) {
 	setDockerEnv()
 	creds := drivers.NewCifsCredentials(user, pass, domain, security, fileMode, dirMode)
 
-	mount := syncDockerState("cifs")
+	mount := newMountManager()
 	d := drivers.NewCIFSDriver(rootForType(drivers.CIFS), creds, netrc, options, mount)
 	if len(user) > 0 {
 		startOutput(fmt.Sprintf("CIFS :: %s, opts: %s", creds, options))
 	} else {
 		startOutput(fmt.Sprintf("CIFS :: netrc: %s, opts: %s", netrc, options))
 	}
-	start(drivers.CIFS, d)
+	start(drivers.CIFS, d, "cifs", mount)
 }
 
 func startOutput(info string) {
@@ -252,13 +253,18 @@ func rootForType(dt drivers.DriverType) string {
 	return filepath.Join(baseDir, dt.String())
 }
 
-func start(dt drivers.DriverType, driver volumeplugin.Driver) {
+func start(dt drivers.DriverType, driver volumeplugin.Driver, driverName string, mountm *drivers.MountManager) {
 	h := volumeplugin.NewHandler(driver)
 	if isTCPEnabled() {
 		addr := os.Getenv(EnvTCPAddr)
 		if addr == "" {
 			addr, _ = rootCmd.PersistentFlags().GetString(PortFlag)
 		}
+		// Start state sync in background after a brief delay to allow the server to start
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			syncDockerState(driverName, mountm)
+		}()
 		// TODO: if platform == windows, use WindowsDefaultDaemonRootDir()
 		fmt.Println(h.ServeTCP(dt.String(), addr, "", nil))
 	} else {
@@ -266,6 +272,11 @@ func start(dt drivers.DriverType, driver volumeplugin.Driver) {
 		if socketName == "" {
 			socketName = dt.String()
 		}
+		// Start state sync in background after a brief delay to allow the server to start
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			syncDockerState(driverName, mountm)
+		}()
 		fmt.Println(h.ServeUnix(socketName, syscall.Getgid()))
 	}
 }
@@ -284,18 +295,19 @@ func isTCPEnabled() bool {
 	return false
 }
 
-func syncDockerState(driverName string) *drivers.MountManager {
+func syncDockerState(driverName string, mount *drivers.MountManager) {
 	log.Infof("Checking for the references of volumes in docker daemon.")
-	mount := newMountManager()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		log.Error(err)
+		return
 	}
 	defer cli.Close()
 
 	volumes, err := cli.VolumeList(context.Background(), volume.ListOptions{})
 	if err != nil {
-		log.Fatal(err, ". Use -a flag to setup the DOCKER_API_VERSION. Run 'docker-volume-netshare --help' for usage.")
+		log.Errorf("Failed to list volumes: %v. Use -a flag to setup the DOCKER_API_VERSION. Run 'docker-volume-netshare --help' for usage.", err)
+		return
 	}
 
 	for _, vol := range volumes.Volumes {
@@ -306,7 +318,6 @@ func syncDockerState(driverName string) *drivers.MountManager {
 		log.Infof("Recovered state: %s , %s , %s , %s , %d ", vol.Name, vol.Mountpoint, vol.Driver, vol.CreatedAt, connections)
 		mount.AddMount(vol.Name, vol.Mountpoint, connections)
 	}
-	return mount
 }
 
 func newMountManager() *drivers.MountManager {
