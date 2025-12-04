@@ -1,17 +1,24 @@
 package drivers
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const (
 	ShareSplitIndentifer = "#"
 )
+
+// MountTimeout is the maximum time to wait for mount operations to complete.
+// Docker has a default 2-minute timeout for plugin operations, so this should
+// be slightly less to allow the plugin to return a proper error message.
+var MountTimeout = 100 * time.Second
 
 func createDest(dest string) error {
 	fi, err := os.Lstat(dest)
@@ -61,7 +68,20 @@ func mountpoint(elem ...string) string {
 }
 
 func run(cmd string) error {
-	if out, err := exec.Command("sh", "-c", cmd).CombinedOutput(); err != nil {
+	return runWithTimeout(cmd, MountTimeout)
+}
+
+func runWithTimeout(cmd string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	command := exec.CommandContext(ctx, "sh", "-c", cmd)
+	out, err := command.CombinedOutput()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			log.Printf("Command timed out after %s: %s", timeout, cmd)
+			return fmt.Errorf("mount operation timed out after %s", timeout)
+		}
 		log.Println(string(out))
 		return err
 	}

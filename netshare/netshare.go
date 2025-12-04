@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/ContainX/docker-volume-netshare/netshare/drivers"
 	"github.com/docker/docker/api/types/container"
@@ -42,6 +43,7 @@ const (
 	CephOpts         = "options"
 	ServerMount      = "servermount"
 	DockerEngineAPI  = "dockerapiversion"
+	MountTimeoutFlag = "mount-timeout"
 	EnvSambaUser     = "NETSHARE_CIFS_USERNAME"
 	EnvSambaPass     = "NETSHARE_CIFS_PASSWORD"
 	EnvSambaWG       = "NETSHARE_CIFS_DOMAIN"
@@ -52,6 +54,7 @@ const (
 	EnvTCP           = "NETSHARE_TCP_ENABLED"
 	EnvTCPAddr       = "NETSHARE_TCP_ADDR"
 	EnvSocketName    = "NETSHARE_SOCKET_NAME"
+	EnvMountTimeout  = "NETSHARE_MOUNT_TIMEOUT"
 	PluginAlias      = "netshare"
 	NetshareHelp     = `
 	docker-volume-netshare (NFS V3/4, AWS EFS and CIFS Volume Driver Plugin)
@@ -120,6 +123,7 @@ func setupFlags() {
 	rootCmd.PersistentFlags().String(PortFlag, ":8877", "TCP Port if --tcp flag is true.  :PORT for all interfaces or ADDRESS:PORT to bind.")
 	rootCmd.PersistentFlags().Bool(VerboseFlag, false, "Turns on verbose logging")
 	rootCmd.PersistentFlags().StringP(DockerEngineAPI, "a", "", "Docker Engine API Version. Default to latest stable.")
+	rootCmd.PersistentFlags().Int(MountTimeoutFlag, 100, "Mount operation timeout in seconds. Docker has a 2-minute timeout for plugin operations, so this should be less than 120. Can also set environment NETSHARE_MOUNT_TIMEOUT")
 
 	cifsCmd.Flags().StringP(UsernameFlag, "u", "", "Username to use for mounts.  Can also set environment NETSHARE_CIFS_USERNAME")
 	cifsCmd.Flags().StringP(PasswordFlag, "p", "", "Password to use for mounts.  Can also set environment NETSHARE_CIFS_PASSWORD")
@@ -162,6 +166,19 @@ func setDockerEnv() {
 	}
 }
 
+func setMountTimeout() {
+	timeout, _ := rootCmd.PersistentFlags().GetInt(MountTimeoutFlag)
+	if os.Getenv(EnvMountTimeout) != "" {
+		if v, err := strconv.Atoi(os.Getenv(EnvMountTimeout)); err == nil && v > 0 {
+			timeout = v
+		}
+	}
+	if timeout > 0 {
+		drivers.MountTimeout = time.Duration(timeout) * time.Second
+		log.Infof("Mount timeout set to %d seconds", timeout)
+	}
+}
+
 func execCEPH(cmd *cobra.Command, args []string) {
 	username, _ := cmd.Flags().GetString(NameFlag)
 	password, _ := cmd.Flags().GetString(SecretFlag)
@@ -171,6 +188,7 @@ func execCEPH(cmd *cobra.Command, args []string) {
 	servermount, _ := cmd.Flags().GetString(ServerMount)
 	cephopts, _ := cmd.Flags().GetString(CephOpts)
 	setDockerEnv()
+	setMountTimeout()
 	if len(username) > 0 {
 		username = "name=" + username
 	}
@@ -188,6 +206,7 @@ func execCEPH(cmd *cobra.Command, args []string) {
 func execNFS(cmd *cobra.Command, args []string) {
 	version, _ := cmd.Flags().GetInt(VersionFlag)
 	setDockerEnv()
+	setMountTimeout()
 	if os.Getenv(EnvNfsVers) != "" {
 		if v, err := strconv.Atoi(os.Getenv(EnvNfsVers)); err == nil {
 			if v == 3 || v == 4 {
@@ -206,6 +225,7 @@ func execEFS(cmd *cobra.Command, args []string) {
 	resolve, _ := cmd.Flags().GetBool(NoResolveFlag)
 	ns, _ := cmd.Flags().GetString(NameServerFlag)
 	setDockerEnv()
+	setMountTimeout()
 	mount := syncDockerState("efs")
 	d := drivers.NewEFSDriver(rootForType(drivers.EFS), ns, !resolve, mount)
 	startOutput(fmt.Sprintf("EFS :: resolve: %v, ns: %s", resolve, ns))
@@ -223,6 +243,7 @@ func execCIFS(cmd *cobra.Command, args []string) {
 	options, _ := cmd.Flags().GetString(OptionsFlag)
 
 	setDockerEnv()
+	setMountTimeout()
 	creds := drivers.NewCifsCredentials(user, pass, domain, security, fileMode, dirMode)
 
 	mount := syncDockerState("cifs")
