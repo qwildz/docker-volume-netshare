@@ -5,10 +5,14 @@ set -e
 # Provides:           dkv-netshare
 # Required-Start:     $syslog $remote_fs $network
 # Required-Stop:      $syslog $remote_fs $network
+# Should-Stop:        docker
+# X-Start-Before:     docker
+# X-Stop-After:       docker
 # Default-Start:      2 3 4 5
 # Default-Stop:       0 1 6
 # Short-Description:  Init for docker-volume-netshare
-# Description: Docker volume plugin supporting NFS, EFS and CIFS
+# Description: Docker volume plugin supporting NFS, EFS and CIFS.
+#              Must start BEFORE docker so Docker can discover the plugin.
 ### END INIT INFO
 
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
