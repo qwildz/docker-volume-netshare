@@ -2,7 +2,6 @@
 Description=Docker NFS, AWS EFS & Samba/CIFS Volume Plugin
 Documentation=https://github.com/ContainX/docker-volume-netshare
 # Plugin must start BEFORE Docker so Docker can discover it during startup
-# Docker should be configured to depend on this service (Before=docker.service)
 Wants=network-online.target
 After=network-online.target
 Before=docker.service
@@ -19,4 +18,4 @@ RestartSec=5s
 StandardOutput=journal
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target docker.service

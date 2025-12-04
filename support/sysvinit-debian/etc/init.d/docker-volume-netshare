@@ -5,7 +5,6 @@ set -e
 # Provides:           dkv-netshare
 # Required-Start:     $syslog $remote_fs $network
 # Required-Stop:      $syslog $remote_fs $network
-# Should-Start:       
 # Should-Stop:        docker
 # X-Start-Before:     docker
 # X-Stop-After:       docker
