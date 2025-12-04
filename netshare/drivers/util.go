@@ -79,7 +79,7 @@ func runWithTimeout(cmd string, timeout time.Duration) error {
 	out, err := command.CombinedOutput()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			log.Printf("Command timed out after %s: %s", timeout, cmd)
+			log.Printf("Command timed out after %s", timeout)
 			return fmt.Errorf("mount operation timed out after %s", timeout)
 		}
 		log.Println(string(out))

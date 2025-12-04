@@ -167,7 +167,10 @@ func setDockerEnv() {
 }
 
 func setMountTimeout() {
-	timeout, _ := rootCmd.PersistentFlags().GetInt(MountTimeoutFlag)
+	timeout, err := rootCmd.PersistentFlags().GetInt(MountTimeoutFlag)
+	if err != nil {
+		timeout = 100 // default value
+	}
 	if os.Getenv(EnvMountTimeout) != "" {
 		if v, err := strconv.Atoi(os.Getenv(EnvMountTimeout)); err == nil && v > 0 {
 			timeout = v
