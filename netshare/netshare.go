@@ -255,16 +255,15 @@ func rootForType(dt drivers.DriverType) string {
 
 func start(dt drivers.DriverType, driver volumeplugin.Driver, driverName string, mountm *drivers.MountManager) {
 	h := volumeplugin.NewHandler(driver)
+
+	// Start state sync in background - waits for socket to be ready before syncing
+	go startStateSyncAfterReady(driverName, mountm)
+
 	if isTCPEnabled() {
 		addr := os.Getenv(EnvTCPAddr)
 		if addr == "" {
 			addr, _ = rootCmd.PersistentFlags().GetString(PortFlag)
 		}
-		// Start state sync in background after a brief delay to allow the server to start
-		go func() {
-			time.Sleep(100 * time.Millisecond)
-			syncDockerState(driverName, mountm)
-		}()
 		// TODO: if platform == windows, use WindowsDefaultDaemonRootDir()
 		fmt.Println(h.ServeTCP(dt.String(), addr, "", nil))
 	} else {
@@ -272,13 +271,30 @@ func start(dt drivers.DriverType, driver volumeplugin.Driver, driverName string,
 		if socketName == "" {
 			socketName = dt.String()
 		}
-		// Start state sync in background after a brief delay to allow the server to start
-		go func() {
-			time.Sleep(100 * time.Millisecond)
-			syncDockerState(driverName, mountm)
-		}()
 		fmt.Println(h.ServeUnix(socketName, syscall.Getgid()))
 	}
+}
+
+// startStateSyncAfterReady waits for the plugin to be ready then syncs Docker volume state.
+// It uses exponential backoff starting at 50ms with a maximum of 10 retries.
+func startStateSyncAfterReady(driverName string, mountm *drivers.MountManager) {
+	maxRetries := 10
+	delay := 50 * time.Millisecond
+
+	for i := 0; i < maxRetries; i++ {
+		time.Sleep(delay)
+		// Try to sync state - if Docker can reach us, it will succeed
+		err := syncDockerStateWithRetry(driverName, mountm)
+		if err == nil {
+			return
+		}
+		log.Debugf("State sync attempt %d failed, retrying: %v", i+1, err)
+		delay *= 2 // Exponential backoff
+		if delay > 2*time.Second {
+			delay = 2 * time.Second
+		}
+	}
+	log.Warnf("Could not sync Docker volume state after %d attempts", maxRetries)
 }
 
 func isTCPEnabled() bool {
@@ -295,29 +311,30 @@ func isTCPEnabled() bool {
 	return false
 }
 
-func syncDockerState(driverName string, mount *drivers.MountManager) {
+// syncDockerStateWithRetry attempts to sync Docker volume state and returns an error if it fails.
+// This is used for retry logic during startup.
+func syncDockerStateWithRetry(driverName string, mount *drivers.MountManager) error {
 	log.Infof("Checking for the references of volumes in docker daemon.")
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		log.Error(err)
-		return
+		return fmt.Errorf("failed to create Docker client: %w", err)
 	}
 	defer cli.Close()
 
 	volumes, err := cli.VolumeList(context.Background(), volume.ListOptions{})
 	if err != nil {
-		log.Errorf("Failed to list volumes: %v. Use -a flag to setup the DOCKER_API_VERSION. Run 'docker-volume-netshare --help' for usage.", err)
-		return
+		return fmt.Errorf("failed to list volumes: %w", err)
 	}
 
 	for _, vol := range volumes.Volumes {
-		if !(vol.Driver == driverName) {
+		if vol.Driver != driverName {
 			continue
 		}
 		connections := activeConnections(vol.Name)
 		log.Infof("Recovered state: %s , %s , %s , %s , %d ", vol.Name, vol.Mountpoint, vol.Driver, vol.CreatedAt, connections)
 		mount.AddMount(vol.Name, vol.Mountpoint, connections)
 	}
+	return nil
 }
 
 func newMountManager() *drivers.MountManager {
