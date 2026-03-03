@@ -60,12 +60,59 @@ func mountpoint(elem ...string) string {
 	return filepath.Join(elem...)
 }
 
+// run executes a command using direct exec (no shell) to prevent shell injection.
+// The cmd string is split on whitespace. For commands that were previously run via
+// "sh -c", callers should switch to runArgs() or runMount()/runUmount().
 func run(cmd string) error {
-	if out, err := exec.Command("sh", "-c", cmd).CombinedOutput(); err != nil {
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 {
+		return fmt.Errorf("empty command")
+	}
+	if out, err := exec.Command(parts[0], parts[1:]...).CombinedOutput(); err != nil {
 		log.Println(string(out))
 		return err
 	}
 	return nil
+}
+
+// runArgs executes a command with explicit arguments, avoiding shell interpretation.
+func runArgs(name string, args ...string) error {
+	if out, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+		log.Println(string(out))
+		return err
+	}
+	return nil
+}
+
+// runMount executes a mount command with the given arguments.
+func runMount(fstype string, opts string, source string, dest string, extraArgs ...string) error {
+	args := []string{}
+	for _, a := range extraArgs {
+		if a != "" {
+			args = append(args, a)
+		}
+	}
+	args = append(args, "-t", fstype)
+	if opts != "" {
+		args = append(args, "-o", opts)
+	}
+	args = append(args, source, dest)
+	return runArgs("mount", args...)
+}
+
+// runUmount executes an umount command for the given mountpoint.
+func runUmount(mountpoint string) error {
+	return runArgs("umount", mountpoint)
+}
+
+// isMounted checks if the given path is currently mounted.
+func isMounted(path string) bool {
+	return runArgs("mountpoint", "-q", path) == nil
+}
+
+// IsMountedCheck is the exported version of isMounted for use by other packages (e.g., state sync).
+func IsMountedCheck(path string) bool {
+	return isMounted(path)
 }
 
 func merge(src, src2 map[string]string) map[string]string {

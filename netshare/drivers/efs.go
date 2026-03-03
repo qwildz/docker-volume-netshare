@@ -22,7 +22,7 @@ type efsDriver struct {
 	dnscache map[string]string
 }
 
-func NewEFSDriver(root, nameserver string, resolve bool, mounts *MountManager) efsDriver {
+func NewEFSDriver(root, nameserver string, resolve bool, mounts *MountManager) (efsDriver, error) {
 
 	d := efsDriver{
 		volumeDriver: newVolumeDriver(root, mounts),
@@ -35,11 +35,10 @@ func NewEFSDriver(root, nameserver string, resolve bool, mounts *MountManager) e
 	}
 	md, err := fetchAWSMetaData()
 	if err != nil {
-		log.Fatalf("Error resolving AWS metadata: %s", err.Error())
-		os.Exit(1)
+		return d, fmt.Errorf("error resolving AWS metadata: %w", err)
 	}
 	d.region = md.Region
-	return d
+	return d, nil
 }
 
 func (e efsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
@@ -51,13 +50,11 @@ func (e efsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) 
 	if e.mountm.HasMount(r.Name) && e.mountm.Count(r.Name) > 0 {
 		log.Infof("Using existing EFS volume mount: %s", hostdir)
 		e.mountm.Increment(r.Name)
-		if err := run(fmt.Sprintf("mountpoint -q %s", hostdir)); err != nil {
-			log.Infof("Existing EFS volume not mounted, force remount.")
-			// Decrement to maintain count before remount
-			e.mountm.Decrement(r.Name)
-		} else {
+		if isMounted(hostdir) {
 			return &volume.MountResponse{Mountpoint: hostdir}, nil
 		}
+		log.Infof("Existing EFS volume not mounted, force remount.")
+		e.mountm.Decrement(r.Name)
 	}
 
 	log.Infof("Mounting EFS volume %s on %s", source, hostdir)
@@ -67,6 +64,7 @@ func (e efsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) 
 	}
 
 	if err := e.mountVolume(source, hostdir); err != nil {
+		os.Remove(hostdir)
 		return nil, err
 	}
 	e.mountm.Add(r.Name, hostdir)
@@ -77,7 +75,6 @@ func (e efsDriver) Unmount(r *volume.UnmountRequest) error {
 	e.m.Lock()
 	defer e.m.Unlock()
 	hostdir := mountpoint(e.root, r.Name)
-	source := e.fixSource(r.Name, r.ID)
 
 	if e.mountm.HasMount(r.Name) {
 		if e.mountm.Count(r.Name) > 1 {
@@ -88,16 +85,17 @@ func (e efsDriver) Unmount(r *volume.UnmountRequest) error {
 		e.mountm.Decrement(r.Name)
 	}
 
-	log.Infof("Unmounting volume %s from %s", source, hostdir)
+	log.Infof("Unmounting volume %s from %s", r.Name, hostdir)
 
-	if err := run(fmt.Sprintf("umount %s", hostdir)); err != nil {
+	if err := runUmount(hostdir); err != nil {
 		return err
 	}
 
 	e.mountm.DeleteIfNotManaged(r.Name)
 
-	if err := os.RemoveAll(r.Name); err != nil {
-		return err
+	// Remove the mountpoint directory (not the volume name!)
+	if err := os.Remove(hostdir); err != nil && !os.IsNotExist(err) {
+		log.Warnf("Failed to remove mountpoint directory %s: %v", hostdir, err)
 	}
 
 	return nil
@@ -132,7 +130,6 @@ func (e efsDriver) fixSource(name, id string) string {
 }
 
 func (e efsDriver) mountVolume(source, dest string) error {
-	cmd := fmt.Sprintf("mount -t nfs4 -o nfsvers=4.1 %s %s", source, dest)
-	log.Debugf("exec: %s\n", cmd)
-	return run(cmd)
+	log.Debugf("exec: mount -t nfs4 -o nfsvers=4.1 %s %s", source, dest)
+	return runMount("nfs4", "nfsvers=4.1", source, dest)
 }

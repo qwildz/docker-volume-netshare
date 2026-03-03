@@ -1,7 +1,6 @@
 package drivers
 
 import (
-	"fmt"
 	"os"
 	"strings"
 
@@ -51,13 +50,11 @@ func (n cephDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error)
 	if n.mountm.HasMount(r.Name) && n.mountm.Count(r.Name) > 0 {
 		log.Infof("Using existing CEPH volume mount: %s", hostdir)
 		n.mountm.Increment(r.Name)
-		if err := run(fmt.Sprintf("mountpoint -q %s", hostdir)); err != nil {
-			log.Infof("Existing CEPH volume not mounted, force remount.")
-			// Decrement to maintain count before remount
-			n.mountm.Decrement(r.Name)
-		} else {
+		if isMounted(hostdir) {
 			return &volume.MountResponse{Mountpoint: hostdir}, nil
 		}
+		log.Infof("Existing CEPH volume not mounted, force remount.")
+		n.mountm.Decrement(r.Name)
 	}
 
 	log.Infof("Mounting CEPH volume %s on %s", source, hostdir)
@@ -66,6 +63,7 @@ func (n cephDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error)
 	}
 
 	if err := n.mountVolume(r.Name, source, hostdir); err != nil {
+		os.Remove(hostdir)
 		return nil, err
 	}
 	n.mountm.Add(r.Name, hostdir)
@@ -90,14 +88,14 @@ func (n cephDriver) Unmount(r *volume.UnmountRequest) error {
 
 	log.Infof("Unmounting volume name %s from %s", r.Name, hostdir)
 
-	if err := run(fmt.Sprintf("umount %s", hostdir)); err != nil {
+	if err := runUmount(hostdir); err != nil {
 		return err
 	}
 
 	n.mountm.DeleteIfNotManaged(r.Name)
 
-	if err := os.RemoveAll(hostdir); err != nil {
-		return err
+	if err := os.Remove(hostdir); err != nil && !os.IsNotExist(err) {
+		log.Warnf("Failed to remove mountpoint directory %s: %v", hostdir, err)
 	}
 
 	return nil
@@ -113,26 +111,24 @@ func (n cephDriver) fixSource(name, id string) string {
 }
 
 func (n cephDriver) mountVolume(name, source, dest string) error {
-	var cmd string
-
 	options := n.mountOptions(n.mountm.GetOptions(name))
-	opts := ""
+
+	var optParts []string
+	optParts = append(optParts, n.context, n.username, n.password)
+
 	if val, ok := options[CephOptions]; ok {
-		fmt.Println("opts = ", val)
-		opts = "-o " + val
+		optParts = append(optParts, val)
 	}
 
-	mountCmd := "mount"
+	opts := strings.Join(optParts, ",")
 
+	var extraArgs []string
 	if log.GetLevel() == log.DebugLevel {
-		mountCmd = mountCmd + " -t ceph"
+		extraArgs = append(extraArgs, "-v")
 	}
 
-	//cmd = fmt.Sprintf("%s -t ceph %s:%s:/ -o %s,%s,%s %s %s", mountCmd, n.cephmount, n.cephport, n.context, n.username, n.password, opts, dest)
-	cmd = fmt.Sprintf("%s -t ceph %s -o %s,%s,%s %s %s", mountCmd, source, n.context, n.username, n.password, opts, dest)
-
-	log.Debugf("exec: %s\n", strings.Replace(cmd, ","+n.password, ",****", 1))
-	return run(cmd)
+	log.Debugf("exec: mount -t ceph %s -o %s %s", source, strings.Replace(opts, n.password, "****", 1), dest)
+	return runMount("ceph", opts, source, dest, extraArgs...)
 }
 
 func (n cephDriver) mountOptions(src map[string]string) map[string]string {

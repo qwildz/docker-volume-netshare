@@ -1,8 +1,8 @@
 package drivers
 
 import (
-	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -76,32 +76,31 @@ func parseNetRC(path string) *netrc.Netrc {
 func (c CifsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 	c.m.Lock()
 	defer c.m.Unlock()
-	hostdir := mountpoint(c.root, r.Name)
-	source := c.fixSource(r.Name)
-	host := c.parseHost(r.Name)
 
 	resolvedName, resOpts := resolveName(r.Name)
+	hostdir := mountpoint(c.root, resolvedName)
+	source := c.fixSource(resolvedName)
+	host := c.parseHost(resolvedName)
 
-	log.Infof("Mount: %s, ID: %s", r.Name, r.ID)
+	log.Infof("Mount: %s, ID: %s, resolved: %s", r.Name, r.ID, resolvedName)
 
 	// Support adhoc mounts (outside of docker volume create)
 	// need to adjust source for ShareOpt
 	if resOpts != nil {
 		if share, found := resOpts[ShareOpt]; found {
 			source = c.fixSource(share)
+			host = c.parseHost(share)
 		}
 	}
 
-	if c.mountm.HasMount(r.Name) && c.mountm.Count(r.Name) > 0 {
+	if c.mountm.HasMount(resolvedName) && c.mountm.Count(resolvedName) > 0 {
 		log.Infof("Using existing CIFS volume mount: %s", hostdir)
-		c.mountm.Increment(r.Name)
-		if err := run(fmt.Sprintf("mountpoint -q %s", hostdir)); err != nil {
-			log.Infof("Existing CIFS volume not mounted, force remount.")
-			// Decrement to maintain count before remount
-			c.mountm.Decrement(r.Name)
-		} else {
+		c.mountm.Increment(resolvedName)
+		if isMounted(hostdir) {
 			return &volume.MountResponse{Mountpoint: hostdir}, nil
 		}
+		log.Infof("Existing CIFS volume not mounted, force remount.")
+		c.mountm.Decrement(resolvedName)
 	}
 
 	log.Infof("Mounting CIFS volume %s on %s", source, hostdir)
@@ -110,15 +109,16 @@ func (c CifsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error)
 		return nil, err
 	}
 
-	if err := c.mountVolume(r.Name, source, hostdir, c.getCreds(host)); err != nil {
+	if err := c.mountVolume(resolvedName, source, hostdir, c.getCreds(host)); err != nil {
+		os.Remove(hostdir)
 		return nil, err
 	}
-	c.mountm.Add(r.Name, hostdir)
+	c.mountm.Add(resolvedName, hostdir)
 
 	if c.mountm.GetOption(resolvedName, ShareOpt) != "" && c.mountm.GetOptionAsBool(resolvedName, CreateOpt) {
 		log.Infof("Mount: Share and Create options enabled - using %s as sub-dir mount", resolvedName)
 		datavol := filepath.Join(hostdir, resolvedName)
-		if err := createDest(filepath.Join(hostdir, resolvedName)); err != nil {
+		if err := createDest(datavol); err != nil {
 			return nil, err
 		}
 		hostdir = datavol
@@ -130,34 +130,26 @@ func (c CifsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error)
 func (c CifsDriver) Unmount(r *volume.UnmountRequest) error {
 	c.m.Lock()
 	defer c.m.Unlock()
-	hostdir := mountpoint(c.root, r.Name)
-	source := c.fixSource(r.Name)
 
-	if c.mountm.HasMount(r.Name) {
-		if c.mountm.Count(r.Name) > 1 {
-			log.Infof("Skipping unmount for %s - in use by other containers", r.Name)
-			c.mountm.Decrement(r.Name)
+	resolvedName, _ := resolveName(r.Name)
+	hostdir := mountpoint(c.root, resolvedName)
+
+	if c.mountm.HasMount(resolvedName) {
+		if c.mountm.Count(resolvedName) > 1 {
+			log.Infof("Skipping unmount for %s - in use by other containers", resolvedName)
+			c.mountm.Decrement(resolvedName)
 			return nil
 		}
-		c.mountm.Decrement(r.Name)
+		c.mountm.Decrement(resolvedName)
 	}
 
-	log.Infof("Unmounting volume %s from %s", source, hostdir)
+	log.Infof("Unmounting volume %s from %s", resolvedName, hostdir)
 
-	if err := run(fmt.Sprintf("umount %s", hostdir)); err != nil {
+	if err := runUmount(hostdir); err != nil {
 		return err
 	}
 
-	c.mountm.DeleteIfNotManaged(r.Name)
-
-	// ToDo:
-	// This is a bad idea.
-	// When there is a dangling mount you will lose all your data in the mounted folder
-	// I didn't understand why you delete all the data ...?
-
-	// if err := os.RemoveAll(hostdir); err != nil {
-	//  	return volume.Response{Err: err.Error()}
-	// }
+	c.mountm.DeleteIfNotManaged(resolvedName)
 
 	return nil
 }
@@ -183,7 +175,7 @@ func (c CifsDriver) parseHost(name string) string {
 }
 
 func (c CifsDriver) mountVolume(name, source, dest string, creds *CifsCreds) error {
-	var opts bytes.Buffer
+	var opts []string
 	var user = creds.user
 	var pass = creds.pass
 	var domain = creds.domain
@@ -193,7 +185,7 @@ func (c CifsDriver) mountVolume(name, source, dest string, creds *CifsCreds) err
 
 	options := merge(c.mountm.GetOptions(name), c.cifsopts)
 	if val, ok := options[CifsOpts]; ok {
-		opts.WriteString(val + ",")
+		opts = append(opts, val)
 	}
 
 	if c.mountm.HasOptions(name) {
@@ -219,37 +211,35 @@ func (c CifsDriver) mountVolume(name, source, dest string, creds *CifsCreds) err
 	}
 
 	if user != "" {
-		// escape single quotes in password character as it will be quoted in command line
-		opts.WriteString(fmt.Sprintf("username='%s',", strings.Replace(user, "'", "\\'", -1)))
+		opts = append(opts, fmt.Sprintf("username=%s", user))
 		if pass != "" {
-			opts.WriteString(fmt.Sprintf("password='%s',", strings.Replace(pass, "'", "\\'", -1)))
+			opts = append(opts, fmt.Sprintf("password=%s", pass))
 		}
 	} else {
-		opts.WriteString("guest,")
+		opts = append(opts, "guest")
 	}
 
 	if domain != "" {
-		opts.WriteString(fmt.Sprintf("domain=%s,", domain))
+		opts = append(opts, fmt.Sprintf("domain=%s", domain))
 	}
 
 	if security != "" {
-		opts.WriteString(fmt.Sprintf("sec=%s,", security))
+		opts = append(opts, fmt.Sprintf("sec=%s", security))
 	}
 
 	if fileMode != "" {
-		opts.WriteString(fmt.Sprintf("file_mode=%s,", fileMode))
+		opts = append(opts, fmt.Sprintf("file_mode=%s", fileMode))
 	}
 
 	if dirMode != "" {
-		opts.WriteString(fmt.Sprintf("dir_mode=%s,", dirMode))
+		opts = append(opts, fmt.Sprintf("dir_mode=%s", dirMode))
 	}
 
-	opts.WriteString("rw ")
+	opts = append(opts, "rw")
 
-	opts.WriteString(fmt.Sprintf("%s %s", source, dest))
-	cmd := fmt.Sprintf("mount -t cifs -o %s", opts.String())
-	log.Debugf("Executing: %s\n", strings.Replace(cmd, "password='"+pass+"'", "password='****'", 1))
-	return run(cmd)
+	optStr := strings.Join(opts, ",")
+	log.Debugf("Executing: mount -t cifs -o %s %s %s", strings.Replace(optStr, "password="+pass, "password=****", 1), source, dest)
+	return runMount("cifs", optStr, source, dest)
 }
 
 func (c CifsDriver) getCreds(host string) *CifsCreds {

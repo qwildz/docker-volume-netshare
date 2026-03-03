@@ -1,6 +1,7 @@
 package drivers
 
 import (
+	"os"
 	"sync"
 
 	"github.com/docker/go-plugins-helpers/volume"
@@ -46,16 +47,33 @@ func (v volumeDriver) Create(r *volume.CreateRequest) error {
 }
 
 func (v volumeDriver) Remove(r *volume.RemoveRequest) error {
-
 	resolvedName, _ := resolveName(r.Name)
-
 	log.Debugf("Entering Remove: name: %s, resolved-name: %s", r.Name, resolvedName)
+
 	v.m.Lock()
 	defer v.m.Unlock()
+
+	// If the mountpoint is still mounted in the kernel, unmount it first
+	// to prevent dangling kernel mounts after volume removal.
+	hostdir := mountpoint(v.root, resolvedName)
+	if isMounted(hostdir) {
+		log.Infof("Remove: volume %s still mounted at %s, unmounting first", resolvedName, hostdir)
+		if err := runUmount(hostdir); err != nil {
+			log.Warnf("Remove: failed to unmount %s: %v (proceeding with removal)", hostdir, err)
+		}
+	}
 
 	if err := v.mountm.Delete(resolvedName); err != nil {
 		return err
 	}
+
+	// Clean up the mountpoint directory
+	if _, err := os.Stat(hostdir); err == nil {
+		if err := os.Remove(hostdir); err != nil {
+			log.Warnf("Remove: failed to remove directory %s: %v", hostdir, err)
+		}
+	}
+
 	return nil
 }
 
@@ -68,8 +86,6 @@ func (v volumeDriver) Path(r *volume.PathRequest) (*volume.PathResponse, error) 
 
 func (v volumeDriver) Get(r *volume.GetRequest) (*volume.GetResponse, error) {
 	log.Debugf("Entering Get: %v", r)
-	v.m.Lock()
-	defer v.m.Unlock()
 	resolvedName, _ := resolveName(r.Name)
 
 	hostdir := mountpoint(v.root, resolvedName)
@@ -83,11 +99,11 @@ func (v volumeDriver) Get(r *volume.GetRequest) (*volume.GetResponse, error) {
 
 func (v volumeDriver) List() (*volume.ListResponse, error) {
 	log.Debugf("Entering List")
+	// GetVolumes is internally synchronized via RWMutex
 	return &volume.ListResponse{Volumes: v.mountm.GetVolumes(v.root)}, nil
 }
 
 func (v volumeDriver) Capabilities() *volume.CapabilitiesResponse {
-	// log.Debugf("Entering Capabilities: %v", r)
 	return &volume.CapabilitiesResponse{
 		Capabilities: volume.Capability{
 			Scope: "local",

@@ -1,7 +1,6 @@
 package drivers
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 
@@ -55,31 +54,23 @@ func (n nfsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) 
 		}
 	}
 
-	if n.mountm.HasMount(resolvedName) {
+	if n.mountm.HasMount(resolvedName) && n.mountm.Count(resolvedName) > 0 {
 		log.Infof("Using existing NFS volume mount: %s", hostdir)
 		n.mountm.Increment(resolvedName)
-		if err := run(fmt.Sprintf("grep -c %s /proc/mounts", hostdir)); err != nil {
-			log.Infof("Existing NFS volume not mounted, force remount.")
-			// maintain count
-			if n.mountm.Count(resolvedName) > 0 {
-				n.mountm.Decrement(resolvedName)
-			}
-		} else {
-			//n.mountm.Increment(resolvedName)
+		if isMounted(hostdir) {
 			return &volume.MountResponse{Mountpoint: hostdir}, nil
 		}
+		log.Infof("Existing NFS volume not mounted, force remount.")
+		n.mountm.Decrement(resolvedName)
 	}
 
 	log.Infof("Mounting NFS volume %s on %s", source, hostdir)
 
 	if err := createDest(hostdir); err != nil {
-		if n.mountm.Count(resolvedName) > 0 {
-			n.mountm.Decrement(resolvedName)
-		}
 		return nil, err
 	}
 
-	if n.mountm.HasMount(resolvedName) == false {
+	if !n.mountm.HasMount(resolvedName) {
 		n.mountm.Create(resolvedName, hostdir, resOpts)
 	}
 
@@ -87,13 +78,15 @@ func (n nfsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) 
 
 	if err := n.mountVolume(resolvedName, source, hostdir, n.version); err != nil {
 		n.mountm.Decrement(resolvedName)
+		// Clean up directory if we created it and mount failed
+		os.Remove(hostdir)
 		return nil, err
 	}
 
 	if n.mountm.GetOption(resolvedName, ShareOpt) != "" && n.mountm.GetOptionAsBool(resolvedName, CreateOpt) {
 		log.Infof("Mount: Share and Create options enabled - using %s as sub-dir mount", resolvedName)
 		datavol := filepath.Join(hostdir, resolvedName)
-		if err := createDest(filepath.Join(hostdir, resolvedName)); err != nil {
+		if err := createDest(datavol); err != nil {
 			n.mountm.Decrement(resolvedName)
 			return nil, err
 		}
@@ -124,20 +117,20 @@ func (n nfsDriver) Unmount(r *volume.UnmountRequest) error {
 
 	log.Infof("Unmounting volume name %s from %s", resolvedName, hostdir)
 
-	if err := run(fmt.Sprintf("umount %s", hostdir)); err != nil {
+	if err := runUmount(hostdir); err != nil {
 		log.Errorf("Error unmounting volume from host: %s", err.Error())
 		return err
 	}
 
 	n.mountm.DeleteIfNotManaged(resolvedName)
 
-	// Check if directory is empty. This command will return "err" if empty
-	if err := run(fmt.Sprintf("ls -1 %s | grep .", hostdir)); err == nil {
-		log.Warnf("Directory %s not empty after unmount. Skipping RemoveAll call.", hostdir)
-	} else {
-		if err := os.RemoveAll(hostdir); err != nil {
-			return err
+	// Only remove directory if it's empty
+	if entries, err := os.ReadDir(hostdir); err == nil && len(entries) == 0 {
+		if err := os.Remove(hostdir); err != nil {
+			log.Warnf("Failed to remove empty mountpoint directory %s: %v", hostdir, err)
 		}
+	} else if err == nil {
+		log.Warnf("Directory %s not empty after unmount. Skipping removal.", hostdir)
 	}
 
 	return nil
@@ -151,18 +144,15 @@ func (n nfsDriver) fixSource(name string) string {
 }
 
 func (n nfsDriver) mountVolume(name, source, dest string, version int) error {
-	var cmd string
-
 	options := merge(n.mountm.GetOptions(name), n.nfsopts)
 	opts := ""
 	if val, ok := options[NfsOptions]; ok {
 		opts = val
 	}
 
-	mountCmd := "mount"
-
+	var extraArgs []string
 	if log.GetLevel() == log.DebugLevel {
-		mountCmd = mountCmd + " -v"
+		extraArgs = append(extraArgs, "-v")
 	}
 
 	switch version {
@@ -171,15 +161,9 @@ func (n nfsDriver) mountVolume(name, source, dest string, version int) error {
 		if len(opts) < 1 {
 			opts = DefaultNfsV3
 		}
-		cmd = fmt.Sprintf("%s -t nfs -o %s %s %s", mountCmd, opts, source, dest)
+		return runMount("nfs", opts, source, dest, extraArgs...)
 	default:
 		log.Debugf("Mounting with NFSv4 - src: %s, dest: %s", source, dest)
-		if len(opts) > 0 {
-			cmd = fmt.Sprintf("%s -t nfs4 -o %s %s %s", mountCmd, opts, source, dest)
-		} else {
-			cmd = fmt.Sprintf("%s -t nfs4 %s %s", mountCmd, source, dest)
-		}
+		return runMount("nfs4", opts, source, dest, extraArgs...)
 	}
-	log.Debugf("exec: %s\n", cmd)
-	return run(cmd)
 }

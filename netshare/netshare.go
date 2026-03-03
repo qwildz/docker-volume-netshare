@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"syscall"
@@ -166,7 +167,7 @@ func setDockerEnv() {
 func execCEPH(cmd *cobra.Command, args []string) {
 	username, _ := cmd.Flags().GetString(NameFlag)
 	password, _ := cmd.Flags().GetString(SecretFlag)
-	context, _ := cmd.Flags().GetString(ContextFlag)
+	ctx, _ := cmd.Flags().GetString(ContextFlag)
 	cephmount, _ := cmd.Flags().GetString(CephMount)
 	cephport, _ := cmd.Flags().GetString(CephPort)
 	servermount, _ := cmd.Flags().GetString(ServerMount)
@@ -178,11 +179,11 @@ func execCEPH(cmd *cobra.Command, args []string) {
 	if len(password) > 0 {
 		password = "secret=" + password
 	}
-	if len(context) > 0 {
-		context = "context=" + "\"" + context + "\""
+	if len(ctx) > 0 {
+		ctx = "context=" + "\"" + ctx + "\""
 	}
 	mount := newMountManager()
-	d := drivers.NewCephDriver(rootForType(drivers.CEPH), username, password, context, cephmount, cephport, servermount, cephopts, mount)
+	d := drivers.NewCephDriver(rootForType(drivers.CEPH), username, password, ctx, cephmount, cephport, servermount, cephopts, mount)
 	start(drivers.CEPH, d, "ceph", mount)
 }
 
@@ -208,7 +209,11 @@ func execEFS(cmd *cobra.Command, args []string) {
 	ns, _ := cmd.Flags().GetString(NameServerFlag)
 	setDockerEnv()
 	mount := newMountManager()
-	d := drivers.NewEFSDriver(rootForType(drivers.EFS), ns, !resolve, mount)
+	d, err := drivers.NewEFSDriver(rootForType(drivers.EFS), ns, !resolve, mount)
+	if err != nil {
+		log.Errorf("Failed to initialize EFS driver: %v", err)
+		os.Exit(1)
+	}
 	startOutput(fmt.Sprintf("EFS :: resolve: %v, ns: %s", resolve, ns))
 	start(drivers.EFS, d, "efs", mount)
 }
@@ -259,19 +264,39 @@ func start(dt drivers.DriverType, driver volumeplugin.Driver, driverName string,
 	// Start state sync in background - waits for socket to be ready before syncing
 	go startStateSyncAfterReady(driverName, mountm)
 
+	// Set up signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		sig := <-sigChan
+		log.Infof("Received signal %v, shutting down %s plugin...", sig, dt.String())
+		// Allow in-flight requests a moment to complete.
+		// The SDK's Serve blocks on listener; closing it is the only way to
+		// stop. Since we don't have access to the internal listener, we exit
+		// cleanly after a brief drain period.
+		time.Sleep(2 * time.Second)
+		log.Infof("Plugin shutdown complete")
+		os.Exit(0)
+	}()
+
 	if isTCPEnabled() {
 		addr := os.Getenv(EnvTCPAddr)
 		if addr == "" {
 			addr, _ = rootCmd.PersistentFlags().GetString(PortFlag)
 		}
-		// TODO: if platform == windows, use WindowsDefaultDaemonRootDir()
-		fmt.Println(h.ServeTCP(dt.String(), addr, "", nil))
+		log.Infof("Serving %s on TCP %s", dt.String(), addr)
+		if err := h.ServeTCP(dt.String(), addr, "", nil); err != nil {
+			log.Errorf("TCP server error: %v", err)
+		}
 	} else {
 		socketName := os.Getenv(EnvSocketName)
 		if socketName == "" {
 			socketName = dt.String()
 		}
-		fmt.Println(h.ServeUnix(socketName, syscall.Getgid()))
+		log.Infof("Serving %s on Unix socket", dt.String())
+		if err := h.ServeUnix(socketName, syscall.Getgid()); err != nil {
+			log.Errorf("Unix socket server error: %v", err)
+		}
 	}
 }
 
@@ -304,15 +329,13 @@ func isTCPEnabled() bool {
 
 	if os.Getenv(EnvTCP) != "" {
 		ev, _ := strconv.ParseBool(os.Getenv(EnvTCP))
-		fmt.Println(ev)
-
 		return ev
 	}
 	return false
 }
 
 // syncDockerStateWithRetry attempts to sync Docker volume state and returns an error if it fails.
-// This is used for retry logic during startup.
+// It verifies each recovered mount is actually present in the kernel mount table.
 func syncDockerStateWithRetry(driverName string, mount *drivers.MountManager) error {
 	log.Infof("Checking for the references of volumes in docker daemon.")
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -321,7 +344,10 @@ func syncDockerStateWithRetry(driverName string, mount *drivers.MountManager) er
 	}
 	defer cli.Close()
 
-	volumes, err := cli.VolumeList(context.Background(), volume.ListOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	volumes, err := cli.VolumeList(ctx, volume.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to list volumes: %w", err)
 	}
@@ -331,40 +357,52 @@ func syncDockerStateWithRetry(driverName string, mount *drivers.MountManager) er
 			continue
 		}
 		connections := activeConnections(vol.Name)
-		log.Infof("Recovered state: %s , %s , %s , %s , %d ", vol.Name, vol.Mountpoint, vol.Driver, vol.CreatedAt, connections)
+
+		// Verify mount is actually present in the kernel.
+		// If connections > 0 but mount is not present, set connections to 0
+		// so the next Mount request will trigger an actual mount operation.
+		if connections > 0 && !drivers.IsMountedCheck(vol.Mountpoint) {
+			log.Warnf("State sync: volume %s has %d connections but mountpoint %s is not mounted. Resetting connections to 0 for remount on next use.",
+				vol.Name, connections, vol.Mountpoint)
+			connections = 0
+		}
+
+		log.Infof("Recovered state: %s, mountpoint: %s, driver: %s, created: %s, connections: %d",
+			vol.Name, vol.Mountpoint, vol.Driver, vol.CreatedAt, connections)
 		mount.AddMount(vol.Name, vol.Mountpoint, connections)
 	}
 	return nil
 }
 
 func newMountManager() *drivers.MountManager {
-	mount := drivers.NewVolumeManager()
-	return mount
+	return drivers.NewVolumeManager()
 }
 
-// The number of running containers using Volume
+// activeConnections returns the number of running containers using the volume.
+// Returns 0 on error instead of crashing the plugin.
 func activeConnections(volumeName string) int {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-
 	if err != nil {
-		log.Error(err)
+		log.Errorf("Failed to create Docker client for active connections check: %v", err)
+		return 0
 	}
 	defer cli.Close()
-	var counter = 0
-	ContainerListResponse, err := cli.ContainerList(context.Background(), container.ListOptions{}) //Only check the running containers using volume
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	containerList, err := cli.ContainerList(ctx, container.ListOptions{})
 	if err != nil {
-		log.Fatal(err, ". Use -a flag to setup the DOCKER_API_VERSION. Run 'docker-volume-netshare --help' for usage.")
+		log.Errorf("Failed to list containers for volume %s: %v. Use -a flag to setup the DOCKER_API_VERSION.", volumeName, err)
+		return 0
 	}
 
-	for _, container := range ContainerListResponse {
-		if len(container.Mounts) == 0 {
-			continue
-		}
-		for _, mounts := range container.Mounts {
-			if !(mounts.Name == volumeName) {
-				continue
+	var counter int
+	for _, ctr := range containerList {
+		for _, mnt := range ctr.Mounts {
+			if mnt.Name == volumeName {
+				counter++
 			}
-			counter++
 		}
 	}
 	return counter

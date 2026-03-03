@@ -2,7 +2,9 @@ package drivers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"time"
 )
 
 const (
@@ -15,13 +17,16 @@ type metaData struct {
 }
 
 func fetchAWSMetaData() (*metaData, error) {
-	r, err := http.Get(MetaDataURL)
+	client := &http.Client{Timeout: 5 * time.Second}
+	r, err := client.Get(MetaDataURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch AWS metadata (timeout 5s): %w", err)
 	}
 	defer r.Body.Close()
 
 	md := &metaData{}
-	json.NewDecoder(r.Body).Decode(md)
+	if err := json.NewDecoder(r.Body).Decode(md); err != nil {
+		return nil, fmt.Errorf("failed to decode AWS metadata: %w", err)
+	}
 	return md, nil
 }

@@ -3,7 +3,10 @@ package drivers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
@@ -24,7 +27,10 @@ type mount struct {
 	managed     bool
 }
 
+// MountManager tracks volume mount state with internal synchronization.
+// All public methods are safe for concurrent use.
 type MountManager struct {
+	mu     sync.RWMutex
 	mounts map[string]*mount
 }
 
@@ -35,11 +41,19 @@ func NewVolumeManager() *MountManager {
 }
 
 func (m *MountManager) HasMount(name string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	_, found := m.mounts[name]
 	return found
 }
 
 func (m *MountManager) HasOptions(name string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.hasOptionsLocked(name)
+}
+
+func (m *MountManager) hasOptionsLocked(name string) bool {
 	c, found := m.mounts[name]
 	if found {
 		return c.opts != nil && len(c.opts) > 0
@@ -48,44 +62,62 @@ func (m *MountManager) HasOptions(name string) bool {
 }
 
 func (m *MountManager) HasOption(name, key string) bool {
-	if m.HasOptions(name) {
-		if _, ok := m.mounts[name].opts[key]; ok {
-			return ok
-		}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.hasOptionLocked(name, key)
+}
+
+func (m *MountManager) hasOptionLocked(name, key string) bool {
+	c, found := m.mounts[name]
+	if found && c.opts != nil {
+		_, ok := c.opts[key]
+		return ok
 	}
 	return false
 }
 
 func (m *MountManager) GetOptions(name string) map[string]string {
-	if m.HasOptions(name) {
-		c, _ := m.mounts[name]
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.hasOptionsLocked(name) {
+		c := m.mounts[name]
 		return c.opts
 	}
 	return map[string]string{}
 }
 
 func (m *MountManager) GetOption(name, key string) string {
-	if m.HasOption(name, key) {
-		v, _ := m.mounts[name].opts[key]
-		return v
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.getOptionLocked(name, key)
+}
+
+func (m *MountManager) getOptionLocked(name, key string) string {
+	if m.hasOptionLocked(name, key) {
+		return m.mounts[name].opts[key]
 	}
 	return ""
 }
 
 func (m *MountManager) GetOptionAsBool(name, key string) bool {
 	rv := strings.ToLower(m.GetOption(name, key))
-	if rv == "yes" || rv == "true" {
-		return true
-	}
-	return false
+	return rv == "yes" || rv == "true"
 }
 
 func (m *MountManager) IsActiveMount(name string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	c, found := m.mounts[name]
 	return found && c.connections > 0
 }
 
 func (m *MountManager) Count(name string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.countLocked(name)
+}
+
+func (m *MountManager) countLocked(name string) int {
 	c, found := m.mounts[name]
 	if found {
 		return c.connections
@@ -94,76 +126,122 @@ func (m *MountManager) Count(name string) int {
 }
 
 func (m *MountManager) Add(name, hostdir string) {
-	_, found := m.mounts[name]
-	if found {
-		m.Increment(name)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, found := m.mounts[name]; found {
+		m.incrementLocked(name)
 	} else {
 		m.mounts[name] = &mount{name: name, hostdir: hostdir, managed: false, connections: 1}
 	}
 }
 
 func (m *MountManager) Create(name, hostdir string, opts map[string]string) *mount {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	c, found := m.mounts[name]
 	if found && c.connections > 0 {
 		c.opts = opts
 		return c
-	} else {
-		mnt := &mount{name: name, hostdir: hostdir, managed: true, opts: opts, connections: 0}
-		m.mounts[name] = mnt
-		return mnt
 	}
+	mnt := &mount{name: name, hostdir: hostdir, managed: true, opts: opts, connections: 0}
+	m.mounts[name] = mnt
+	return mnt
 }
 
+// Delete removes a volume if it has no active connections and no container references.
+// Docker API calls are made outside the lock to avoid blocking other operations.
 func (m *MountManager) Delete(name string) error {
-	// Check if any stopped containers are having references with volume.
-	refCount := checkReferences(name)
-	log.Debugf("Reference count %d", refCount)
-	if m.HasMount(name) {
-		if m.Count(name) < 1 && refCount < 1 {
-			log.Debugf("Delete volume: %s, connections: %d", name, m.Count(name))
-			delete(m.mounts, name)
-			return nil
-		}
+	// Quick check under read lock
+	m.mu.RLock()
+	mnt, found := m.mounts[name]
+	if !found {
+		m.mu.RUnlock()
+		return nil
+	}
+	if mnt.connections >= 1 {
+		m.mu.RUnlock()
 		return errors.New("Volume is currently in use")
 	}
+	m.mu.RUnlock()
+
+	// Check Docker API for container references OUTSIDE the lock
+	refCount, err := checkReferences(name)
+	if err != nil {
+		log.Errorf("Error checking volume references for %s: %v. Assuming volume is in use for safety.", name, err)
+		return fmt.Errorf("failed to check volume references: %w", err)
+	}
+	log.Debugf("Reference count for %s: %d", name, refCount)
+
+	if refCount >= 1 {
+		return errors.New("Volume is currently in use")
+	}
+
+	// Acquire write lock and delete (re-check under lock in case state changed)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mnt, found = m.mounts[name]
+	if !found {
+		return nil
+	}
+	if mnt.connections >= 1 {
+		return errors.New("Volume is currently in use")
+	}
+
+	log.Debugf("Delete volume: %s, connections: %d", name, mnt.connections)
+	delete(m.mounts, name)
 	return nil
 }
 
 func (m *MountManager) DeleteIfNotManaged(name string) error {
-	if m.HasMount(name) && !m.IsActiveMount(name) && !m.mounts[name].managed {
-		log.Infof("Removing un-managed volume")
-		return m.Delete(name)
+	m.mu.RLock()
+	mnt, found := m.mounts[name]
+	if !found || mnt.connections > 0 || mnt.managed {
+		m.mu.RUnlock()
+		return nil
 	}
-	return nil
+	m.mu.RUnlock()
+
+	log.Infof("Removing un-managed volume: %s", name)
+	return m.Delete(name)
 }
 
 func (m *MountManager) Increment(name string) int {
-	log.Infof("Incrementing for %s", name)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.incrementLocked(name)
+}
+
+func (m *MountManager) incrementLocked(name string) int {
 	c, found := m.mounts[name]
-	log.Infof("Previous connections state : %d", c.connections)
 	if found {
+		log.Infof("Incrementing for %s: %d -> %d", name, c.connections, c.connections+1)
 		c.connections++
-		log.Infof("Current connections state : %d", c.connections)
 		return c.connections
 	}
 	return 0
 }
 
 func (m *MountManager) Decrement(name string) int {
-	log.Infof("Decrementing for %s", name)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.decrementLocked(name)
+}
+
+func (m *MountManager) decrementLocked(name string) int {
 	c, found := m.mounts[name]
-	log.Infof("Previous connections state : %d", c.connections)
 	if found && c.connections > 0 {
+		log.Infof("Decrementing for %s: %d -> %d", name, c.connections, c.connections-1)
 		c.connections--
-		log.Infof("Current connections state :  %d", c.connections)
+		return c.connections
 	}
 	return 0
 }
 
 func (m *MountManager) GetVolumes(rootPath string) []*volume.Volume {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	volumes := []*volume.Volume{}
-
 	for _, mount := range m.mounts {
 		volumes = append(volumes, &volume.Volume{Name: mount.name, Mountpoint: mount.hostdir})
 	}
@@ -171,34 +249,35 @@ func (m *MountManager) GetVolumes(rootPath string) []*volume.Volume {
 }
 
 func (m *MountManager) AddMount(name string, hostdir string, connections int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.mounts[name] = &mount{name: name, hostdir: hostdir, managed: true, connections: connections}
 }
 
-// Checking volume references with started and stopped containers as well.
-func checkReferences(volumeName string) int {
-
+// checkReferences queries Docker for containers (running + stopped) referencing the volume.
+// Returns the count and any error instead of calling log.Fatal.
+func checkReferences(volumeName string) (int, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		log.Error(err)
+		return 0, fmt.Errorf("failed to create Docker client: %w", err)
 	}
 	defer cli.Close()
 
-	var counter = 0
-	ContainerListResponse, err := cli.ContainerList(context.Background(), container.ListOptions{All: true}) // All : true will return the stopped containers as well.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	containerList, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
-		log.Fatal(err, ". Use -a flag to setup the DOCKER_API_VERSION. Run 'docker-volume-netshare --help' for usage.")
+		return 0, fmt.Errorf("failed to list containers: %w (use -a flag to setup the DOCKER_API_VERSION)", err)
 	}
 
-	for _, container := range ContainerListResponse {
-		if len(container.Mounts) == 0 {
-			continue
-		}
-		for _, mounts := range container.Mounts {
-			if !(mounts.Name == volumeName) {
-				continue
+	var counter int
+	for _, ctr := range containerList {
+		for _, mnt := range ctr.Mounts {
+			if mnt.Name == volumeName {
+				counter++
 			}
-			counter++
 		}
 	}
-	return counter
+	return counter, nil
 }
